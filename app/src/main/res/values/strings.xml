@@ -1,0 +1,12 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <string name="app_name">Trích Xuất Trắc Nghiệm</string>
+    <string name="settings_title">Cài Đặt API Keys</string>
+    <string name="api_keys_subtitle">Hệ thống xoay tua tự động khi một Key chạm hạn ngạch (quota limit)</string>
+    <string name="save_keys">Lưu danh sách Keys</string>
+    <string name="pick_images">Chọn ảnh đề thi (1 hoặc nhiều)</string>
+    <string name="extract_button">Bắt đầu trích xuất</string>
+    <string name="copy_all">Sao chép tất cả</string>
+    <string name="clear_all">Xóa làm mới</string>
+    <string name="no_images_selected">Chưa chọn hình ảnh nào</string>
+    <string name="status_ready">Sẵn sàng chọn ảnh hoặc ảnh chụp màn hình</string>
+</resources>
