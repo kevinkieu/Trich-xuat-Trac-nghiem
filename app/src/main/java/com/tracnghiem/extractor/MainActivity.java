@@ -155,7 +155,7 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onSuccess(String formattedResult, int usedSlotNumber) {
+            public void onSuccess(String formattedResult, String summaryInfo) {
                 runOnUiThread(() -> {
                     binding.layoutProgress.setVisibility(View.GONE);
                     binding.btnExtract.setEnabled(true);
@@ -171,7 +171,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                     dbHelper.insertHistory(firstLine, formattedResult, imgCount);
 
-                    Toast.makeText(MainActivity.this, "Trích xuất thành công bằng Key Ô #" + usedSlotNumber + "! Đã lưu vào Lịch sử.", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(MainActivity.this, summaryInfo + "! Đã lưu vào Lịch sử.", Toast.LENGTH_SHORT).show();
                 });
             }
 

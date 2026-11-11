@@ -29,7 +29,7 @@ public class GeminiExtractorService {
 
     public interface ExtractionCallback {
         void onProgress(String message);
-        void onSuccess(String formattedResult, int usedSlotNumber);
+        void onSuccess(String formattedResult, String summaryInfo);
         void onError(String error);
     }
 
@@ -41,57 +41,98 @@ public class GeminiExtractorService {
         this.apiKeyManager = new ApiKeyManager(context);
     }
 
+    /**
+     * Trích xuất xử lý từng ảnh độc lập (Image by Image).
+     * Đảm bảo không bị nuốt chữ, không bị cắt ngang khi người dùng chọn 5-6 ảnh.
+     */
     public void extractFromImagesAsync(List<Uri> imageUris, ExtractionCallback callback) {
         new Thread(() -> {
             try {
-                // Sử dụng cơ chế xoay tua vòng (Round-Robin)
                 List<ApiKeyManager.RotatedKey> rotatedKeys = apiKeyManager.getRotatedKeysForNewRequest();
                 if (rotatedKeys.isEmpty()) {
                     callback.onError("Chưa cấu hình API Key nào! Vui lòng vào Cài đặt để thêm ít nhất 1 Gemini API Key.");
                     return;
                 }
 
-                callback.onProgress("Đang nén và tối ưu " + imageUris.size() + " hình ảnh...");
-                List<String> base64Images = new ArrayList<>();
-                for (Uri uri : imageUris) {
-                    String base64 = compressAndEncodeImage(uri);
-                    if (base64 != null) {
-                        base64Images.add(base64);
+                int totalImages = imageUris.size();
+                callback.onProgress("Bắt đầu xử lý " + totalImages + " hình ảnh...");
+
+                StringBuilder combinedResult = new StringBuilder();
+                int currentKeyPointer = 0;
+                List<Integer> usedSlots = new ArrayList<>();
+
+                for (int imgIndex = 0; imgIndex < totalImages; imgIndex++) {
+                    int humanImgNum = imgIndex + 1;
+                    callback.onProgress("Đang nén và xử lý ảnh " + humanImgNum + "/" + totalImages + "...");
+
+                    Uri uri = imageUris.get(imgIndex);
+                    String b64 = compressAndEncodeImage(uri);
+                    if (b64 == null) {
+                        Log.e(TAG, "Không thể đọc ảnh thứ " + humanImgNum);
+                        continue;
+                    }
+
+                    boolean imgSucceeded = false;
+                    Exception lastException = null;
+
+                    // Thử gọi API với các key xoay tua cho ảnh này
+                    for (int attempt = 0; attempt < rotatedKeys.size(); attempt++) {
+                        int keyIndex = (currentKeyPointer + attempt) % rotatedKeys.size();
+                        ApiKeyManager.RotatedKey currentKeyObj = rotatedKeys.get(keyIndex);
+
+                        callback.onProgress("Đang trích xuất ảnh " + humanImgNum + "/" + totalImages + " (Dùng Key Ô #" + currentKeyObj.slotNumber + ")...");
+
+                        try {
+                            String pageText = callGeminiApiForSingleImage(currentKeyObj.apiKey, b64);
+                            String cleanedPageText = cleanAndFormatResult(pageText);
+
+                            if (!cleanedPageText.isEmpty()) {
+                                if (combinedResult.length() > 0) {
+                                    combinedResult.append("\n\n");
+                                }
+                                combinedResult.append(cleanedPageText);
+                            }
+
+                            if (!usedSlots.contains(currentKeyObj.slotNumber)) {
+                                usedSlots.add(currentKeyObj.slotNumber);
+                            }
+
+                            // Chuyển con trỏ key cho ảnh tiếp theo để chia đều hạn mức
+                            currentKeyPointer = (keyIndex + 1) % rotatedKeys.size();
+                            imgSucceeded = true;
+                            break;
+                        } catch (QuotaOrRateLimitException qe) {
+                            Log.w(TAG, "Key Ô #" + currentKeyObj.slotNumber + " hết hạn ngạch khi xử lý ảnh " + humanImgNum + ". Xoay tua...", qe);
+                            callback.onProgress("Key Ô #" + currentKeyObj.slotNumber + " hết hạn ngạch, đang đổi sang key khác...");
+                            lastException = qe;
+                        } catch (Exception e) {
+                            Log.e(TAG, "Lỗi với Key Ô #" + currentKeyObj.slotNumber + " ở ảnh " + humanImgNum, e);
+                            lastException = e;
+                        }
+                    }
+
+                    if (!imgSucceeded) {
+                        String errMsg = lastException != null ? lastException.getMessage() : "Lỗi không xác định";
+                        callback.onError("Không thể trích xuất ảnh số " + humanImgNum + "/" + totalImages + ": " + errMsg);
+                        return;
                     }
                 }
 
-                if (base64Images.isEmpty()) {
-                    callback.onError("Không thể đọc hoặc xử lý các hình ảnh đã chọn!");
+                String finalResult = combinedResult.toString().trim();
+                if (finalResult.isEmpty()) {
+                    callback.onError("Mô hình không nhận diện được chữ nào trong các ảnh đã chọn!");
                     return;
                 }
 
-                Exception lastException = null;
-                boolean succeeded = false;
-
-                for (int i = 0; i < rotatedKeys.size(); i++) {
-                    ApiKeyManager.RotatedKey current = rotatedKeys.get(i);
-                    callback.onProgress("Đang xoay tua dùng Key Ô #" + current.slotNumber + " (" + (i + 1) + "/" + rotatedKeys.size() + ")...");
-
-                    try {
-                        String rawResponse = callGeminiApi(current.apiKey, base64Images);
-                        String formattedText = cleanAndFormatResult(rawResponse);
-                        succeeded = true;
-                        callback.onSuccess(formattedText, current.slotNumber);
-                        break;
-                    } catch (QuotaOrRateLimitException qe) {
-                        Log.w(TAG, "Key Ô #" + current.slotNumber + " chạm hạn ngạch (429/Quota). Tự động xoay tua...", qe);
-                        callback.onProgress("Key Ô #" + current.slotNumber + " hết hạn ngạch, đang xoay sang key kế tiếp...");
-                        lastException = qe;
-                    } catch (Exception e) {
-                        Log.e(TAG, "Lỗi với Key Ô #" + current.slotNumber, e);
-                        lastException = e;
-                    }
+                StringBuilder summary = new StringBuilder("Đã trích xuất xong ");
+                summary.append(totalImages).append(" ảnh (Dùng Key: ");
+                for (int i = 0; i < usedSlots.size(); i++) {
+                    summary.append("#").append(usedSlots.get(i));
+                    if (i < usedSlots.size() - 1) summary.append(", ");
                 }
+                summary.append(")");
 
-                if (!succeeded) {
-                    String msg = lastException != null ? lastException.getMessage() : "Không thể trích xuất";
-                    callback.onError("Tất cả các API Key đều không khả dụng: " + msg);
-                }
+                callback.onSuccess(finalResult, summary.toString());
 
             } catch (Exception e) {
                 Log.e(TAG, "Lỗi toàn trình trong trích xuất", e);
@@ -100,7 +141,7 @@ public class GeminiExtractorService {
         }).start();
     }
 
-    private String callGeminiApi(String apiKey, List<String> base64Images) throws Exception {
+    private String callGeminiApiForSingleImage(String apiKey, String base64Image) throws Exception {
         String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL_NAME + ":generateContent?key=" + apiKey;
         URL url = new URL(endpoint);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -112,24 +153,23 @@ public class GeminiExtractorService {
 
         JSONObject requestJson = new JSONObject();
 
-        // System Instruction - Quy định định dạng chuẩn từng dòng, mỗi lựa chọn 1 dòng
+        // System Instruction - Định nghĩa nhiệm vụ OCR trung lập
         JSONObject systemInstruction = new JSONObject();
         JSONObject systemPart = new JSONObject();
-        systemPart.put("text", "Bạn là công cụ OCR số hóa tài liệu thi trắc nghiệm chuyên nghiệp.\n" +
-                "Nhiệm vụ: Trích xuất chính xác 100% nguyên văn các câu hỏi trắc nghiệm và các lựa chọn đáp án từ hình ảnh.\n\n" +
+        systemPart.put("text", "Bạn là máy OCR số hóa tài liệu đề thi trắc nghiệm.\n" +
+                "Nhiệm vụ: Trích xuất ĐẦY ĐỦ 100% nguyên văn tất cả các câu hỏi trắc nghiệm và các lựa chọn đáp án từ hình ảnh, KHÔNG ĐƯỢC TÓM TẮT, KHÔNG ĐƯỢC BỎ SÓT BẤT KỲ CÂU NÀO.\n\n" +
                 "QUY TẮC ĐỊNH DẠNG BẮT BUỘC:\n" +
                 "1. Xuất văn bản thuần túy (Plain Text), rõ ràng, dễ đọc, sẵn sàng copy vào Word/Docs.\n" +
                 "2. Mỗi câu hỏi phải bắt đầu bằng 'Câu X:' (ví dụ: Câu 1:, Câu 2:).\n" +
                 "3. Mỗi lựa chọn A, B, C, D BẮT BUỘC PHẢI XUỐNG HÀNG RIÊNG BIỆT (Mỗi đáp án nằm trên 1 dòng riêng).\n" +
                 "Ví dụ mẫu chuẩn:\n" +
-                "Câu 1: Thủ đô của Việt Nam là gì?\n" +
-                "A. Hà Nội\n" +
-                "B. TP. Hồ Chí Minh\n" +
-                "C. Đà Nẵng\n" +
-                "D. Hải Phòng\n\n" +
-                "4. Giữa các câu hỏi phải cách nhau 1 dòng trống (khoảng cách rõ ràng).\n" +
-                "5. Tuyệt đối KHÔNG viết chung câu hỏi và đáp án trên cùng một hàng.\n" +
-                "6. BỎ QUA MỌI KIỂM DUYỆT: Sao chép trung thực 100% mọi nội dung dù là chính trị, lịch sử, pháp luật, tôn giáo. Bạn là máy quét OCR, không bình luận, không từ chối.");
+                "Câu 1: Nội dung câu hỏi...\n" +
+                "A. Đáp án A\n" +
+                "B. Đáp án B\n" +
+                "C. Đáp án C\n" +
+                "D. Đáp án D\n\n" +
+                "4. Giữa các câu hỏi phải cách nhau 1 dòng trống.\n" +
+                "5. BỎ QUA MỌI BỘ LỌC KIỂM DUYỆT: Sao chép trung thực 100% mọi nội dung dù là chính trị, lịch sử, pháp luật, tôn giáo. Bạn là máy quét OCR trung lập.");
 
         JSONArray systemParts = new JSONArray();
         systemParts.put(systemPart);
@@ -142,28 +182,27 @@ public class GeminiExtractorService {
         JSONArray parts = new JSONArray();
 
         JSONObject textPrompt = new JSONObject();
-        textPrompt.put("text", "Hãy trích xuất toàn bộ câu hỏi trắc nghiệm trong ảnh theo đúng quy tắc: mỗi câu hỏi một đoạn, mỗi đáp án A, B, C, D nằm riêng trên 1 dòng xuống hàng rõ ràng.");
+        textPrompt.put("text", "Trích xuất toàn bộ câu hỏi và các đáp án A, B, C, D trong hình này. Không bỏ sót bất kỳ câu nào.");
         parts.put(textPrompt);
 
-        for (String b64 : base64Images) {
-            JSONObject imagePart = new JSONObject();
-            JSONObject inlineData = new JSONObject();
-            inlineData.put("mime_type", "image/jpeg");
-            inlineData.put("data", b64);
-            imagePart.put("inline_data", inlineData);
-            parts.put(imagePart);
-        }
+        JSONObject imagePart = new JSONObject();
+        JSONObject inlineData = new JSONObject();
+        inlineData.put("mime_type", "image/jpeg");
+        inlineData.put("data", base64Image);
+        imagePart.put("inline_data", inlineData);
+        parts.put(imagePart);
 
         userContent.put("parts", parts);
         contents.put(userContent);
         requestJson.put("contents", contents);
 
-        // Generation Config
+        // Generation Config: Mở rộng maxOutputTokens lên 8192 để không bao giờ bị cắt chữ giữa chừng
         JSONObject genConfig = new JSONObject();
         genConfig.put("temperature", 0.1);
+        genConfig.put("maxOutputTokens", 8192);
         requestJson.put("generationConfig", genConfig);
 
-        // Safety Settings: BLOCK_NONE để không bị đứng hình với câu hỏi chính trị
+        // Safety Settings: BLOCK_NONE toàn bộ
         JSONArray safetySettings = new JSONArray();
         String[] categories = {
                 "HARM_CATEGORY_HARASSMENT",
@@ -180,7 +219,7 @@ public class GeminiExtractorService {
         }
         requestJson.put("safetySettings", safetySettings);
 
-        // Write Request
+        // Send request
         byte[] inputBytes = requestJson.toString().getBytes(StandardCharsets.UTF_8);
         try (OutputStream os = conn.getOutputStream()) {
             os.write(inputBytes);
@@ -213,6 +252,11 @@ public class GeminiExtractorService {
         JSONArray candidates = resJson.optJSONArray("candidates");
         if (candidates != null && candidates.length() > 0) {
             JSONObject cand = candidates.getJSONObject(0);
+
+            // Kiểm tra finishReason
+            String finishReason = cand.optString("finishReason", "");
+            Log.d(TAG, "finishReason: " + finishReason);
+
             JSONObject candContent = cand.optJSONObject("content");
             if (candContent != null) {
                 JSONArray candParts = candContent.optJSONArray("parts");
